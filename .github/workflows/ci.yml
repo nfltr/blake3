@@ -1,0 +1,24 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+      - name: vet
+        # upstream's amd64 assembly predates vet's asmdecl checks
+        run: |
+          if [ "$(go env GOARCH)" = amd64 ]; then go vet -asmdecl=false ./...; else go vet ./...; fi
+      - run: go test -count=1 ./...
+      - run: go test -count=1 -tags purego ./...
+      - run: go test -count=1 -race ./...
+      - run: go test -run '^$' -fuzz FuzzCompressBuffer -fuzztime 20s ./guts

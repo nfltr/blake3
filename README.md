@@ -1,12 +1,72 @@
 blake3
 ------
 
-[![GoDoc](https://godoc.org/lukechampine.com/blake3?status.svg)](https://godoc.org/lukechampine.com/blake3)
-[![Go Report Card](http://goreportcard.com/badge/lukechampine.com/blake3)](https://goreportcard.com/report/lukechampine.com/blake3)
+```
+go get github.com/nfltr/blake3
+```
+
+This is a fork of [lukechampine.com/blake3](https://github.com/lukechampine/blake3)
+v1.4.1 that adds arm64 NEON assembly; everything else is upstream's, under
+its MIT license. The NEON code is offered upstream; once upstream has arm64
+assembly, use upstream.
+
+## What this fork adds: arm64 NEON
+
+Upstream has assembly for amd64 only (AVX2, AVX-512); on arm64 it runs the
+pure-Go compression. This fork adds NEON for arm64 (Apple Silicon, Graviton,
+Ampere, Raspberry Pi 4/5), in Go's arm64 assembler, no cgo.
+
+### Design
+
+- **What is vectorized.** `guts.CompressBuffer` (up to 16 chunks, which
+  `Hasher.Write`, `Sum256` and `bao` all go through) compresses each 4 whole
+  chunks in one call of `compressChunksNEON`, one chunk per 32-bit lane of a
+  128-bit register, the way the official
+  [blake3_neon.c](https://github.com/BLAKE3-team/BLAKE3/blob/master/c/blake3_neon.c)
+  does. `mergeSubtrees` compresses each 4 parents of a tree level with 4 or
+  more in one call of `compressBlocksNEON`. Fewer than 4 chunks, a partial
+  last chunk, the last parents of a buffer, single-block compression and the
+  XOF stay on the generic code.
+- **Layout.** V0-V15 hold the 16 state words (V0-V7 also the chaining value
+  from one block to the next), V16-V23 the message words of one step,
+  V24-V27 temporaries, V28-V30 and a general register the IV, V31 a byte
+  table. Each block's message is loaded from the 4 chunks and transposed
+  (4x4 word transposes with TRN1/TRN2) into a 256-byte scratch, from which
+  each step loads its 8 words. The 4 columns (then the 4 diagonals) of G run
+  interleaved; rotations by 12 and 7 are a shift and a shift-right-insert
+  (SHL+SRI), by 16 a halfword reverse (REV32), by 8 a byte table (TBL).
+- **Generated, not hand-written.** `guts/gen_arm64.go` writes
+  `guts/compress_arm64.s` (`go generate ./guts`); the message schedule is
+  derived from BLAKE3's permutation, as in the specification.
+- **Fallback.** NEON is part of every arm64 CPU Go supports, so there is no
+  feature detection. The `purego` build tag (`go build -tags purego`) keeps
+  the generic code on arm64; amd64 is unchanged.
+
+### Proof
+
+- The official BLAKE3 test vectors (`testdata/vectors.json`: hash, keyed
+  hash, derive key, extended output, lengths 0 to 102400) pass, as do the
+  Bao encode/decode/slice round trips (`bao/`).
+- `guts.TestCompressBufferDifferential` compares `CompressBuffer` with the
+  generic code on 3000 inputs: every whole-chunk count, random lengths, IV
+  and random keys, the keyed and derive-key flags, counters across 2^32;
+  `guts.FuzzCompressBuffer` does the same for fuzzed inputs
+  (`go test -fuzz FuzzCompressBuffer ./guts`).
+- CI (`.github/workflows/ci.yml`) runs vet, the tests with and without
+  `purego`, `-race` and a short fuzz on linux/amd64, linux/arm64 and
+  darwin/arm64.
+
+### Benchmarks (Apple M5, darwin/arm64)
+
+`benchstat`, 6 runs each, upstream v1.4.1 against this fork:
 
 ```
-go get lukechampine.com/blake3
+CompressBuffer (16 KiB, one core)   18.20us -> 7.73us   -57.5%
+Sum256/65536                        52.60us -> 34.10us  -35.2%
+Sum256/1048576                      332.3us -> 187.0us  -43.7%  (2.94 -> 5.22 GiB/s)
 ```
+
+## Upstream README
 
 `blake3` implements the [BLAKE3 cryptographic hash function](https://github.com/BLAKE3-team/BLAKE3).
 This implementation aims to be performant without sacrificing (too much)
