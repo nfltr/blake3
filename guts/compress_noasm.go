@@ -7,12 +7,6 @@ import (
 	"encoding/binary"
 )
 
-// CompressBuffer compresses up to MaxSIMD chunks in parallel and returns their
-// root node.
-func CompressBuffer(buf *[MaxSIMD * ChunkSize]byte, buflen int, key *[8]uint32, counter uint64, flags uint32) Node {
-	return compressBufferGeneric(buf, buflen, key, counter, flags)
-}
-
 // CompressChunk compresses a single chunk, returning its final (uncompressed)
 // node.
 func CompressChunk(chunk []byte, key *[8]uint32, counter uint64, flags uint32) Node {
@@ -46,10 +40,6 @@ func CompressBlocks(out *[MaxSIMD * BlockSize]byte, n Node) {
 	for i := range outs {
 		copy(out[i*64:], outs[i][:])
 	}
-}
-
-func mergeSubtrees(cvs *[MaxSIMD][8]uint32, numCVs uint64, key *[8]uint32, flags uint32) Node {
-	return mergeSubtreesGeneric(cvs, numCVs, key, flags)
 }
 
 // BytesToWords converts an array of 64 bytes to an array of 16 bytes.
