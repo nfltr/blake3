@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" width="96" alt="nfltr"></p>
+
 blake3
 ------
 
@@ -7,8 +9,9 @@ go get github.com/nfltr/blake3
 
 This is a fork of [lukechampine.com/blake3](https://github.com/lukechampine/blake3)
 v1.4.1 that adds arm64 NEON assembly; everything else is upstream's, under
-its MIT license. The NEON code is offered upstream; once upstream has arm64
-assembly, use upstream.
+its MIT license. nfltr-send ([github.com/nfltr/send](https://github.com/nfltr/send))
+uses it for its files' BLAKE3 roots and Bao verified streams. Once upstream
+has arm64 assembly, use upstream.
 
 ## What this fork adds: arm64 NEON
 
@@ -47,11 +50,14 @@ Ampere, Raspberry Pi 4/5), in Go's arm64 assembler, no cgo.
 - The official BLAKE3 test vectors (`testdata/vectors.json`: hash, keyed
   hash, derive key, extended output, lengths 0 to 102400) pass, as do the
   Bao encode/decode/slice round trips (`bao/`).
-- `guts.TestCompressBufferDifferential` compares `CompressBuffer` with the
-  generic code on 3000 inputs: every whole-chunk count, random lengths, IV
+- `guts.TestCompressBufferDifferential` compares `CompressBuffer` with a
+  reference that uses no assembly (the generic chunk compression and
+  subtree merge) on 3000 inputs: every whole-chunk count, random lengths, IV
   and random keys, the keyed and derive-key flags, counters across 2^32;
   `guts.FuzzCompressBuffer` does the same for fuzzed inputs
-  (`go test -fuzz FuzzCompressBuffer ./guts`).
+  (`go test -fuzz FuzzCompressBuffer ./guts`), and
+  `guts.TestMergeSubtreesDifferential` checks the assembly subtree merge
+  against the generic one for every chaining-value count.
 - CI (`.github/workflows/ci.yml`) runs vet, the tests with and without
   `purego`, `-race` and a short fuzz on linux/amd64, linux/arm64 and
   darwin/arm64.
