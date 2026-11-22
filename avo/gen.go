@@ -154,14 +154,12 @@ func genCompressChunksAVX512() {
 	XORQ(loop, loop)
 	Label("loop")
 
-	Comment("Load transposed block")
-	VMOVDQU32(globals.seq, vs[8])
-	VPSLLD(Imm(10), vs[8], vs[8]) // stride of 1024
+	Comment("Load each chunk's block, then transpose them")
 	for i, m := range mv {
-		KXNORD(K1, K1, K1)
-		VPGATHERDD(buf.Offset(i*4).Idx(vs[8], 1), K1, m)
+		VMOVDQU32(buf.Offset(i*1024), m)
 	}
 	ADDQ(Imm(64), buf.Base)
+	mv = transpose16x16(mv)
 
 	Comment("Reload state vectors (other than CVs)")
 	for i := 0; i < 4; i++ {
@@ -194,6 +192,48 @@ func genCompressChunksAVX512() {
 	}
 
 	RET()
+}
+
+// transpose16x16 transposes 16 vectors of 16 words in place (as
+// transpose_vecs_512 in the official blake3_avx512.c), with loads and
+// shuffles instead of VPGATHERDD (a gather per message word is slow where
+// the Gather Data Sampling mitigation is on: Skylake to Ice Lake, GCP's
+// n2): it returns the registers so that the i-th holds word i of every
+// input. Each step turns a pair into a pair; the pair's first register
+// takes the next step's temporary, so nothing is moved.
+func transpose16x16(m [16]VecVirtual) [16]VecVirtual {
+	tmp := ZMM()
+	pair := func(lo, hi func(a, b, dst VecVirtual), x, y VecVirtual) (VecVirtual, VecVirtual) {
+		t := tmp
+		lo(x, y, t)
+		hi(x, y, y)
+		tmp = x
+		return t, y
+	}
+	unpackLo32 := func(a, b, dst VecVirtual) { VPUNPCKLDQ(b, a, dst) }
+	unpackHi32 := func(a, b, dst VecVirtual) { VPUNPCKHDQ(b, a, dst) }
+	unpackLo64 := func(a, b, dst VecVirtual) { VPUNPCKLQDQ(b, a, dst) }
+	unpackHi64 := func(a, b, dst VecVirtual) { VPUNPCKHQDQ(b, a, dst) }
+	unpackLo128 := func(a, b, dst VecVirtual) { VSHUFI32X4(Imm(0x88), b, a, dst) }
+	unpackHi128 := func(a, b, dst VecVirtual) { VSHUFI32X4(Imm(0xdd), b, a, dst) }
+
+	var a, b, c, d [16]VecVirtual
+	for k := 0; k < 8; k++ { // ab_0, ab_2 of each pair of inputs
+		a[2*k], a[2*k+1] = pair(unpackLo32, unpackHi32, m[2*k], m[2*k+1])
+	}
+	for j := 0; j < 4; j++ { // abcd_0..3 of each 4
+		b[4*j], b[4*j+1] = pair(unpackLo64, unpackHi64, a[4*j], a[4*j+2])
+		b[4*j+2], b[4*j+3] = pair(unpackLo64, unpackHi64, a[4*j+1], a[4*j+3])
+	}
+	for j := 0; j < 2; j++ { // abcdefgh_0..7 of each 8
+		for i := 0; i < 4; i++ {
+			c[8*j+i], c[8*j+4+i] = pair(unpackLo128, unpackHi128, b[8*j+i], b[8*j+4+i])
+		}
+	}
+	for i := 0; i < 8; i++ {
+		d[i], d[8+i] = pair(unpackLo128, unpackHi128, c[i], c[8+i])
+	}
+	return d
 }
 
 func performRoundsAVX512(vs, mv [16]VecVirtual) {
