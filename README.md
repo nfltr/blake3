@@ -72,6 +72,29 @@ Sum256/65536                        52.60us -> 34.10us  -35.2%
 Sum256/1048576                      332.3us -> 187.0us  -43.7%  (2.94 -> 5.22 GiB/s)
 ```
 
+### Bao chunk groups (`guts.CompressSubtree`)
+
+A Bao chunk group (nfltr-send's is 256 KiB, 2^8 chunks) is hashed by
+`guts.CompressSubtree`: every chunk's chaining value in place first
+(AVX-512 16, AVX2 8, NEON 4 at a time), then each level of parents across
+the whole group, so every lane of a parent compression has a parent (it
+was each 16 chunks merged on their own: of a group's 255 parents, 48 AVX2
+calls with half or more lanes idle above 8 parents and 31 parents in Go;
+now 34 full AVX2 calls and one). `TestCompressSubtreeDifferential`,
+`FuzzCompressSubtree` (against a reference with no assembly and BLAKE3's
+own tree shape; `TestCompressSubtreeAVX2` runs the AVX2 path on an
+AVX-512 machine) and `FuzzVerifyChunk` prove it.
+`bao.BenchmarkVerifyChunkTransfer` is the receiver's call shape (each
+chunk of a 256 MiB file in turn: hot, cold, and on every P at once);
+v1.5.1 -> this, `benchstat` 6 runs interleaved, GCP:
+
+```
+                         n2 (Cascade Lake)  c3 (Sapphire Rapids)  t2a (Neoverse-N1)
+VerifyChunkTransfer/hot       +11.7%              +11.3%               +3.0%
+VerifyChunkTransfer/cold      +11.1%               +8.7%               +2.3%
+VerifyChunkTransfer/parallel  +12.2%               +6.5%                 ~
+```
+
 ## Upstream README
 
 `blake3` implements the [BLAKE3 cryptographic hash function](https://github.com/BLAKE3-team/BLAKE3).
