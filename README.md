@@ -8,8 +8,9 @@ go get github.com/nfltr/blake3
 ```
 
 This is a fork of [lukechampine.com/blake3](https://github.com/lukechampine/blake3)
-v1.4.1 that adds arm64 NEON assembly; everything else is upstream's, under
-its MIT license. nfltr-send ([github.com/nfltr/send](https://github.com/nfltr/send))
+v1.4.1 that adds arm64 NEON assembly, amd64 kernels that load and
+transpose instead of gathering, and a Bao chunk group hashed a level at
+a time (below); everything else is upstream's, under its MIT license. nfltr-send ([github.com/nfltr/send](https://github.com/nfltr/send))
 uses it for its files' BLAKE3 roots and Bao verified streams. Once upstream
 has arm64 assembly, use upstream.
 
@@ -84,15 +85,23 @@ now 34 full AVX2 calls and one). `TestCompressSubtreeDifferential`,
 `FuzzCompressSubtree` (against a reference with no assembly and BLAKE3's
 own tree shape; `TestCompressSubtreeAVX2` runs the AVX2 path on an
 AVX-512 machine) and `FuzzVerifyChunk` prove it.
+
+The amd64 kernels load each block and transpose them (unpacks and
+`VSHUFI32X4`/`VPERM2I128`, prefetching 4 blocks ahead, as the official
+`blake3_avx512.c` and `blake3_avx2.c`), not a `VPGATHERDD` per message
+word as upstream: where the Gather Data Sampling mitigation is on
+(Skylake to Ice Lake, e.g. GCP n2) a gather is slow, and one core
+compressed 16 KiB at 2.77 GB/s there against about 5 for `b3sum`.
+
 `bao.BenchmarkVerifyChunkTransfer` is the receiver's call shape (each
 chunk of a 256 MiB file in turn: hot, cold, and on every P at once);
-v1.5.1 -> this, `benchstat` 6 runs interleaved, GCP:
+v1.5.1 -> this, `benchstat` 6 runs interleaved, GCP 8 vCPUs:
 
 ```
-                         n2 (Cascade Lake)  c3 (Sapphire Rapids)  t2a (Neoverse-N1)
-VerifyChunkTransfer/hot       +11.7%              +11.3%               +3.0%
-VerifyChunkTransfer/cold      +11.1%               +8.7%               +2.3%
-VerifyChunkTransfer/parallel  +12.2%               +6.5%                 ~
+VerifyChunkTransfer  n2 (Cascade Lake)        c3 (Sapphire Rapids)     t2a (Neoverse-N1)
+hot                  2.37 -> 4.37 GiB/s +84%  3.72 -> 4.36 GiB/s +17%  1.02 -> 1.05 GiB/s +3%
+cold                 2.15 -> 3.48 GiB/s +61%  3.35 -> 3.46 GiB/s  +3%  0.98 -> 1.00 GiB/s +2%
+parallel             11.8 -> 16.4 GiB/s +39%  16.9 -> 17.2 GiB/s  +2%  7.73 -> 7.73 GiB/s  ~
 ```
 
 ## Upstream README
