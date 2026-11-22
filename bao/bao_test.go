@@ -239,3 +239,40 @@ func TestBaoSlice(t *testing.T) {
 		}
 	}
 }
+
+// TestBaoGroupRootIsBLAKE3: a large chunk group's root is the input's
+// BLAKE3 hash (compressGroup compresses whole MaxSIMD chunks in place; the
+// lengths cross those and the group's boundaries), and its chunks verify.
+func TestBaoGroupRootIsBLAKE3(t *testing.T) {
+	const group = 8 // 256 KiB
+	for _, n := range []int{0, 1, 16383, 16384, 16385, 65536, 262143, 262144, 262145, 300000, 1 << 20} {
+		input := make([]byte, n)
+		for i := range input {
+			input[i] = byte(i*7 + i>>8)
+		}
+		outboard, root := bao.EncodeBuf(input, group, true)
+		if root != blake3.Sum256(input) {
+			t.Errorf("%d bytes: root is not the BLAKE3 hash", n)
+		}
+		for off := 0; off < n; off += 1 << 18 {
+			if !bao.VerifyChunk(input[off:min(off+1<<18, n)], outboard, group, uint64(off), root) {
+				t.Errorf("%d bytes: the chunk at %d does not verify", n, off)
+			}
+		}
+	}
+}
+
+// BenchmarkVerifyChunk: one 256 KiB chunk group verified against a 64 MiB
+// outboard (as nfltr-send's receiver verifies each arriving chunk).
+func BenchmarkVerifyChunk(b *testing.B) {
+	const group = 8
+	input := make([]byte, 64<<20)
+	outboard, root := bao.EncodeBuf(input, group, true)
+	b.SetBytes(1 << 18)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !bao.VerifyChunk(input[1<<20:1<<20+1<<18], outboard, group, 1<<20, root) {
+			b.Fatal("does not verify")
+		}
+	}
+}
