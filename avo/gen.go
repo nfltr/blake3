@@ -154,8 +154,9 @@ func genCompressChunksAVX512() {
 	XORQ(loop, loop)
 	Label("loop")
 
-	Comment("Load each chunk's block, then transpose them")
+	Comment("Load each chunk's block (prefetching 4 blocks ahead, as blake3_avx512.c), then transpose them")
 	for i, m := range mv {
+		PREFETCHT0(buf.Offset(i*1024 + 256))
 		VMOVDQU32(buf.Offset(i*1024), m)
 	}
 	ADDQ(Imm(64), buf.Base)
@@ -383,15 +384,18 @@ func genCompressChunksAVX2() {
 	XORQ(loop, loop)
 	Label("loop")
 
-	Comment("Load transposed block")
-	VMOVDQU(globals.seq, vs[9])
-	VPSLLD(Imm(10), vs[9], vs[9]) // stride of 1024
-	for i := 0; i < 16; i++ {
-		VPCMPEQD(vs[8], vs[8], vs[8]) // fastest way to set all bits to 1
-		VPGATHERDD(vs[8], buf.Offset(i*4).Idx(vs[9], 1), vs[10])
-		VMOVDQU(vs[10], mv[i])
+	Comment("Load each chunk's block, then transpose them (the CVs wait in cvs, written only at the end)")
+	for i := 0; i < 8; i++ {
+		VMOVDQU(vs[i], cvs.Offset(i*32))
 	}
+	for i := 0; i < 8; i++ { // 4 blocks ahead, as blake3_avx2.c
+		PREFETCHT0(buf.Offset(i*1024 + 256))
+	}
+	loadTransposedAVX2(vs, mv, func(row, half int) Mem { return buf.Offset(row*1024 + half*32) })
 	ADDQ(Imm(64), buf.Base)
+	for i := 0; i < 8; i++ {
+		VMOVDQU(cvs.Offset(i*32), vs[i])
+	}
 
 	Comment("Reload state vectors (other than CVs)")
 	for i := 0; i < 4; i++ {
@@ -439,14 +443,8 @@ func genCompressParentsAVX2() {
 		mv[i] = AllocLocal(32)
 	}
 
-	Comment("Load transposed block")
-	VMOVDQU(globals.seq, vs[9])
-	VPSLLD(Imm(6), vs[9], vs[9]) // stride of 64
-	for i := 0; i < 16; i++ {
-		VPCMPEQD(vs[8], vs[8], vs[8]) // fastest way to set all bits to 1
-		VPGATHERDD(vs[8], cvs.Offset(i*4).Idx(vs[9], 1), vs[10])
-		VMOVDQU(vs[10], mv[i])
-	}
+	Comment("Load each parent's block, then transpose them")
+	loadTransposedAVX2(vs, mv, func(row, half int) Mem { return cvs.Offset(row*64 + half*32) })
 
 	Comment("Initialize state vectors")
 	for i, v := range vs {
@@ -558,6 +556,22 @@ func loadCounter(counter Mem, dst, scratch []VecVirtual) {
 	const perm = 0<<0 | 2<<2 | 1<<4 | 3<<6
 	VPERMQ(Imm(perm), dst[0], dst[0])
 	VPERMQ(Imm(perm), dst[1], dst[1])
+}
+
+// loadTransposedAVX2 stores word i of the 8 blocks at(row, half) (half
+// 0 is a block's words 0-7, 1 its words 8-15) into mv[i]: 8 loads and an
+// 8x8 transpose per half, not a VPGATHERDD per word (slow where the Gather
+// Data Sampling mitigation is on). It uses every register of vs.
+func loadTransposedAVX2(vs [16]VecVirtual, mv [16]Mem, at func(row, half int) Mem) {
+	for h := 0; h < 2; h++ {
+		for r := 0; r < 8; r++ {
+			VMOVDQU(at(r, h), vs[r])
+		}
+		transpose(vs[:8], vs[8:])
+		for i := 0; i < 8; i++ {
+			VMOVDQU(vs[8+i], mv[8*h+i])
+		}
+	}
 }
 
 func transpose(src, dst []VecVirtual) {
