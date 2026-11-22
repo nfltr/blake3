@@ -1,6 +1,7 @@
 package guts
 
 import (
+	"math/bits"
 	"math/rand"
 	"testing"
 )
@@ -105,5 +106,89 @@ func BenchmarkCompressBuffer(b *testing.B) {
 	b.SetBytes(int64(len(buf)))
 	for i := 0; i < b.N; i++ {
 		CompressBuffer(&buf, len(buf), &IV, 0, 0)
+	}
+}
+
+// subtreeReference is CompressSubtree with no assembly and BLAKE3's own
+// tree shape: each chunk on its own, then the left subtree taking the
+// largest power of two of the chunks short of all.
+func subtreeReference(buf []byte, key *[8]uint32, counter uint64, flags uint32) Node {
+	if len(buf) <= ChunkSize {
+		return CompressChunk(buf, key, counter, flags)
+	}
+	var cvs [][8]uint32
+	for off := 0; off < len(buf); off += ChunkSize {
+		cvs = append(cvs, ChainingValue(CompressChunk(buf[off:min(off+ChunkSize, len(buf))], key, counter+uint64(len(cvs)), flags)))
+	}
+	var rec func(cvs [][8]uint32) Node
+	rec = func(cvs [][8]uint32) Node {
+		mid := 1 << (bits.Len(uint(len(cvs)-1)) - 1)
+		l, r := cvs[:mid], cvs[mid:]
+		lcv, rcv := l[0], r[0]
+		if len(l) > 1 {
+			lcv = ChainingValue(rec(l))
+		}
+		if len(r) > 1 {
+			rcv = ChainingValue(rec(r))
+		}
+		return ParentNode(lcv, rcv, key, flags)
+	}
+	return rec(cvs)
+}
+
+func checkSubtree(t *testing.T, buf []byte, key *[8]uint32, counter uint64, flags uint32) {
+	t.Helper()
+	if got, want := CompressSubtree(buf, key, counter, flags), subtreeReference(buf, key, counter, flags); got != want {
+		t.Fatalf("CompressSubtree(len %d, counter %#x, flags %#x) = %v, want %v", len(buf), counter, flags, got, want)
+	}
+}
+
+// TestCompressSubtreeDifferential compares CompressSubtree (assembly where
+// the platform has it) with subtreeReference: every whole-chunk count up to
+// MaxSubtree, random lengths, keys, flags and counters across 2^32.
+func TestCompressSubtreeDifferential(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	buf := make([]byte, MaxSubtree)
+	for i := 0; i < 1500; i++ {
+		rng.Read(buf)
+		key := IV
+		if rng.Intn(2) == 0 {
+			for j := range key {
+				key[j] = rng.Uint32()
+			}
+		}
+		n := 1 + rng.Intn(len(buf))
+		if i < MaxSubtree/ChunkSize {
+			n = (i + 1) * ChunkSize // every whole-chunk count
+		}
+		counter := rng.Uint64() >> uint(rng.Intn(64))
+		if i%7 == 0 {
+			counter = 1<<32 - uint64(rng.Intn(2*MaxSIMD)) // lanes straddle the high word
+		}
+		checkSubtree(t, buf[:n], &key, counter, testFlags[rng.Intn(len(testFlags))])
+	}
+}
+
+func FuzzCompressSubtree(f *testing.F) {
+	f.Add([]byte("abc"), uint16(0), uint64(0), uint8(0))
+	f.Add(make([]byte, ChunkSize), uint16(17*ChunkSize+5), uint64(1<<32-3), uint8(1))
+	f.Fuzz(func(t *testing.T, in []byte, n uint16, counter uint64, fl uint8) {
+		if len(in) == 0 {
+			return
+		}
+		// stretch in to n bytes (at most 64 KiB) so whole SIMD windows and
+		// their remainders both run
+		buf := make([]byte, max(len(in), int(n)))
+		for off := 0; off < len(buf); off += copy(buf[off:], in) {
+		}
+		checkSubtree(t, buf, &IV, counter, testFlags[int(fl)%len(testFlags)])
+	})
+}
+
+func BenchmarkCompressSubtree(b *testing.B) {
+	buf := make([]byte, MaxSubtree)
+	b.SetBytes(int64(len(buf)))
+	for i := 0; i < b.N; i++ {
+		CompressSubtree(buf, &IV, 0, 0)
 	}
 }

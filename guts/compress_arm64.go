@@ -76,3 +76,40 @@ func mergeSubtrees(cvs *[MaxSIMD][8]uint32, numCVs uint64, key *[8]uint32, flags
 	}
 	return mergeSubtreesGeneric(cvs, numCVs, key, flags)
 }
+
+// chunkCVs writes the chaining value of each whole chunk of buf (len(cvs)
+// of them, the first chunk counter) into cvs, 4 at a time in place.
+func chunkCVs(cvs [][8]uint32, buf []byte, key *[8]uint32, counter uint64, flags uint32) {
+	var fl [16]uint32
+	for i := range fl {
+		fl[i] = flags
+	}
+	fl[0] |= FlagChunkStart
+	fl[15] |= FlagChunkEnd
+	var msg [64]uint32
+	for len(cvs) >= 4 {
+		var ctr [8]uint32
+		for j := range uint64(4) {
+			ctr[j], ctr[4+j] = uint32(counter+j), uint32((counter+j)>>32)
+		}
+		compressChunksNEON((*[4][8]uint32)(cvs), (*[4 * ChunkSize]byte)(buf), key, &ctr, &fl, &msg)
+		cvs, buf, counter = cvs[4:], buf[4*ChunkSize:], counter+4
+	}
+	chunkCVsGeneric(cvs, buf, key, counter, flags)
+}
+
+// parentCVs replaces cvs[i] with the parent of cvs[2i] and cvs[2i+1], for
+// each of the len(cvs)/2 pairs, 4 at a time (as mergeSubtrees does).
+func parentCVs(cvs [][8]uint32, key *[8]uint32, flags uint32) {
+	fl := [16]uint32{flags | FlagParent}
+	var ctr [8]uint32
+	var msg [64]uint32
+	rem := len(cvs) / 2
+	i := 0
+	for ; i+4 <= rem; i += 4 {
+		compressBlocksNEON((*[4][8]uint32)(cvs[i:]), (*[4 * BlockSize]byte)(unsafe.Pointer(&cvs[2*i])), key, &ctr, &fl, &msg)
+	}
+	for ; i < rem; i++ {
+		cvs[i] = ChainingValue(ParentNode(cvs[2*i], cvs[2*i+1], key, flags))
+	}
+}

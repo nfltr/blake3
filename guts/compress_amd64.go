@@ -135,3 +135,66 @@ func BytesToWords(bytes [64]byte) [16]uint32 {
 func WordsToBytes(words [16]uint32) [64]byte {
 	return *(*[64]byte)(unsafe.Pointer(&words))
 }
+
+// chunkCVs writes the chaining value of each whole chunk of buf (len(cvs)
+// of them, the first chunk counter) into cvs: the widest kernel in place
+// over each whole window of chunks, the last part of a window through a
+// copy (a file's last chunk group).
+func chunkCVs(cvs [][8]uint32, buf []byte, key *[8]uint32, counter uint64, flags uint32) {
+	switch {
+	case haveAVX512:
+		for len(cvs) >= MaxSIMD {
+			compressChunksAVX512((*[MaxSIMD][8]uint32)(cvs), (*[MaxSIMD * ChunkSize]byte)(buf), key, counter, flags)
+			cvs, buf, counter = cvs[MaxSIMD:], buf[MaxSIMD*ChunkSize:], counter+MaxSIMD
+		}
+		if len(cvs) > 1 {
+			var b [MaxSIMD * ChunkSize]byte
+			var t [MaxSIMD][8]uint32
+			copy(b[:], buf)
+			compressChunksAVX512(&t, &b, key, counter, flags)
+			copy(cvs, t[:])
+			return
+		}
+	case haveAVX2:
+		for len(cvs) >= 8 {
+			compressChunksAVX2((*[8][8]uint32)(cvs), (*[8 * ChunkSize]byte)(buf), key, counter, flags)
+			cvs, buf, counter = cvs[8:], buf[8*ChunkSize:], counter+8
+		}
+		if len(cvs) > 1 {
+			var b [8 * ChunkSize]byte
+			var t [8][8]uint32
+			copy(b[:], buf)
+			compressChunksAVX2(&t, &b, key, counter, flags)
+			copy(cvs, t[:])
+			return
+		}
+	}
+	chunkCVsGeneric(cvs, buf, key, counter, flags)
+}
+
+// parentCVs replaces cvs[i] with the parent of cvs[2i] and cvs[2i+1], for
+// each of the len(cvs)/2 pairs: 8 at a time, a last 3 to 7 through a copy.
+// (A window's call reads its 16 CVs before writing its 8 parents, and
+// window k writes cvs[8k:8k+8], which no later window reads.)
+func parentCVs(cvs [][8]uint32, key *[8]uint32, flags uint32) {
+	if !haveAVX2 {
+		parentCVsGeneric(cvs, key, flags)
+		return
+	}
+	i := 0
+	for ; len(cvs)-2*i >= 16; i += 8 {
+		compressParentsAVX2((*[8][8]uint32)(cvs[i:]), (*[16][8]uint32)(cvs[2*i:]), key, flags)
+	}
+	rest := cvs[2*i:]
+	if len(rest) < 6 { // 1 or 2 parents: the generic code is faster than an 8-lane call
+		for j := 0; j < len(rest)/2; j++ {
+			cvs[i+j] = ChainingValue(ParentNode(rest[2*j], rest[2*j+1], key, flags))
+		}
+		return
+	}
+	var t [16][8]uint32
+	var p [8][8]uint32
+	copy(t[:], rest)
+	compressParentsAVX2(&p, &t, key, flags)
+	copy(cvs[i:], p[:len(rest)/2])
+}

@@ -27,8 +27,13 @@ func cvToBytes(cv *[8]uint32) *[32]byte {
 	return &b
 }
 
+// compressGroup is the root node of chunk group p, whose first chunk is chunk
+// counter (BenchmarkVerifyChunkTransfer).
 func compressGroup(p []byte, counter uint64) guts.Node {
-	var stack [54 - guts.MaxSIMD][8]uint32
+	if len(p) <= guts.MaxSubtree { // a group of 2^8 chunks or fewer: in place, a level at a time
+		return guts.CompressSubtree(p, &guts.IV, counter, 0)
+	}
+	var stack [54 - 8][8]uint32
 	var sc uint64
 	pushSubtree := func(cv [8]uint32) {
 		i := 0
@@ -40,20 +45,14 @@ func compressGroup(p []byte, counter uint64) guts.Node {
 		sc++
 	}
 
-	// Each whole MaxSIMD chunks of p is compressed in place, not copied
-	// (BenchmarkVerifyChunk); only a short last part goes through buf.
-	const whole = guts.MaxSIMD * guts.ChunkSize
-	for len(p) > whole { // not the last part: a subtree
-		pushSubtree(guts.ChainingValue(guts.CompressBuffer((*[whole]byte)(p), whole, &guts.IV, counter+(sc*guts.MaxSIMD), 0)))
+	// A larger group is its MaxSubtree pieces, each a whole subtree but
+	// the last.
+	const whole, chunks = guts.MaxSubtree, guts.MaxSubtree / guts.ChunkSize
+	for len(p) > whole {
+		pushSubtree(guts.ChainingValue(guts.CompressSubtree(p[:whole], &guts.IV, counter+sc*chunks, 0)))
 		p = p[whole:]
 	}
-	var n guts.Node
-	if len(p) == whole {
-		n = guts.CompressBuffer((*[whole]byte)(p), whole, &guts.IV, counter+(sc*guts.MaxSIMD), 0)
-	} else {
-		var buf [whole]byte
-		n = guts.CompressBuffer(&buf, copy(buf[:], p), &guts.IV, counter+(sc*guts.MaxSIMD), 0)
-	}
+	n := guts.CompressSubtree(p, &guts.IV, counter+sc*chunks, 0)
 	for i := bits.TrailingZeros64(sc); i < bits.Len64(sc); i++ {
 		if sc&(1<<i) != 0 {
 			n = guts.ParentNode(stack[i], guts.ChainingValue(n), &guts.IV, 0)

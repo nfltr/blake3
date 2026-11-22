@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"github.com/nfltr/blake3"
@@ -244,22 +245,65 @@ func TestBaoSlice(t *testing.T) {
 // BLAKE3 hash (compressGroup compresses whole MaxSIMD chunks in place; the
 // lengths cross those and the group's boundaries), and its chunks verify.
 func TestBaoGroupRootIsBLAKE3(t *testing.T) {
-	const group = 8 // 256 KiB
-	for _, n := range []int{0, 1, 16383, 16384, 16385, 65536, 262143, 262144, 262145, 300000, 1 << 20} {
-		input := make([]byte, n)
-		for i := range input {
-			input[i] = byte(i*7 + i>>8)
-		}
-		outboard, root := bao.EncodeBuf(input, group, true)
-		if root != blake3.Sum256(input) {
-			t.Errorf("%d bytes: root is not the BLAKE3 hash", n)
-		}
-		for off := 0; off < n; off += 1 << 18 {
-			if !bao.VerifyChunk(input[off:min(off+1<<18, n)], outboard, group, uint64(off), root) {
-				t.Errorf("%d bytes: the chunk at %d does not verify", n, off)
+	for _, group := range []int{8, 10} { // 256 KiB (guts.MaxSubtree), 1 MiB (its pieces)
+		for _, n := range []int{0, 1, 16383, 16384, 16385, 65536, 262143, 262144, 262145, 300000, 1 << 20, 1<<20 + 1, 3<<20 + 5000} {
+			input := make([]byte, n)
+			for i := range input {
+				input[i] = byte(i*7 + i>>8)
+			}
+			outboard, root := bao.EncodeBuf(input, group, true)
+			if root != blake3.Sum256(input) {
+				t.Errorf("group %d, %d bytes: root is not the BLAKE3 hash", group, n)
+			}
+			gs := 1024 << group
+			for off := 0; off < n; off += gs {
+				if !bao.VerifyChunk(input[off:min(off+gs, n)], outboard, group, uint64(off), root) {
+					t.Errorf("group %d, %d bytes: the chunk at %d does not verify", group, n, off)
+				}
 			}
 		}
 	}
+}
+
+// FuzzVerifyChunk: for a file of any size up to 2 MiB, its every 256 KiB
+// chunk verifies against its outboard and root (the BLAKE3 hash), and a
+// chunk with one byte changed, or the outboard with one of the root's
+// children changed, does not.
+func FuzzVerifyChunk(f *testing.F) {
+	f.Add(uint32(1), uint32(0), uint32(0), uint8(1))
+	f.Add(uint32(1<<18), uint32(0), uint32(1<<18-1), uint8(0x80))
+	f.Add(uint32(1<<20+17), uint32(4), uint32(16), uint8(3))
+	f.Fuzz(func(t *testing.T, n, chunk, pos uint32, x uint8) {
+		const group, gs = 8, 1 << 18
+		n %= 2<<20 + 1
+		if n == 0 || x == 0 {
+			return
+		}
+		input := make([]byte, n)
+		blake3.New(0, nil).XOF().Read(input)
+		outboard, root := bao.EncodeBuf(input, group, true)
+		if root != blake3.Sum256(input) {
+			t.Fatalf("%d bytes: root is not the BLAKE3 hash", n)
+		}
+		off := int(chunk%((n+gs-1)/gs)) * gs
+		p := input[off:min(off+gs, int(n))]
+		if !bao.VerifyChunk(p, outboard, group, uint64(off), root) {
+			t.Fatalf("%d bytes: the chunk at %d does not verify", n, off)
+		}
+		i := int(pos) % len(p)
+		p[i] ^= x
+		if bao.VerifyChunk(p, outboard, group, uint64(off), root) {
+			t.Fatalf("%d bytes: the chunk at %d verifies with byte %d changed", n, off, i)
+		}
+		p[i] ^= x
+		if len(outboard) > 8 { // the root's two children are on every chunk's path
+			j := 8 + int(pos)%64
+			outboard[j] ^= x
+			if bao.VerifyChunk(p, outboard, group, uint64(off), root) {
+				t.Fatalf("%d bytes: the chunk at %d verifies with outboard byte %d changed", n, off, j)
+			}
+		}
+	})
 }
 
 // BenchmarkVerifyChunk: one 256 KiB chunk group verified against a 64 MiB
@@ -275,4 +319,45 @@ func BenchmarkVerifyChunk(b *testing.B) {
 			b.Fatal("does not verify")
 		}
 	}
+}
+
+// BenchmarkVerifyChunkTransfer verifies 256 KiB chunks in the shape of
+// nfltr-send's receiver: each chunk of a 256 MiB file in turn against the
+// file's whole outboard. hot is one chunk again and again (as
+// BenchmarkVerifyChunk, in the cache); cold walks the file (each chunk
+// from memory, as a chunk that has left the cache); parallel is cold on
+// every P at once (the receiver verifies up to 8 chunks at a time, so a
+// core's SIMD units are shared with its hyperthread and AVX-512's clock).
+func BenchmarkVerifyChunkTransfer(b *testing.B) {
+	const group, gs, size = 8, 1 << 18, 256 << 20
+	input := make([]byte, size)
+	blake3.New(0, nil).XOF().Read(input) // every page written: no shared zero page
+	outboard, root := bao.EncodeBuf(input, group, true)
+	verify := func(b *testing.B, i int) {
+		off := i * gs
+		if !bao.VerifyChunk(input[off:off+gs], outboard, group, uint64(off), root) {
+			b.Fatal("does not verify")
+		}
+	}
+	b.Run("hot", func(b *testing.B) {
+		b.SetBytes(gs)
+		for i := 0; i < b.N; i++ {
+			verify(b, 1)
+		}
+	})
+	b.Run("cold", func(b *testing.B) {
+		b.SetBytes(gs)
+		for i := 0; i < b.N; i++ {
+			verify(b, i%(size/gs))
+		}
+	})
+	b.Run("parallel", func(b *testing.B) {
+		b.SetBytes(gs)
+		var next atomic.Int64
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				verify(b, int(next.Add(1)%(size/gs)))
+			}
+		})
+	})
 }
